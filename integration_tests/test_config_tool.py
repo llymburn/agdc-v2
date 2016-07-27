@@ -10,7 +10,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 import datacube.scripts.cli_app
-from datacube.index.postgres.tables._core import drop_db, has_schema
+from datacube.index.postgres.tables._core import drop_db, has_schema, SCHEMA_NAME
 
 _LOG = logging.getLogger(__name__)
 
@@ -142,12 +142,12 @@ def test_list_users_does_not_fail(global_integration_cli_args, local_config):
     assert result.exit_code == 0
 
 
-def test_db_init_noop(global_integration_cli_args, local_config):
+def test_db_init_noop(global_integration_cli_args, local_config, default_metadata_type):
     # Run on an existing database.
     opts = list(global_integration_cli_args)
     opts.extend(
         [
-            '-v', 'system', 'init'
+            '-vv', 'system', 'init'
         ]
     )
     result = _run_cli(
@@ -156,6 +156,33 @@ def test_db_init_noop(global_integration_cli_args, local_config):
     )
     assert result.exit_code == 0
     assert 'Updated.' in result.output
+    # It should not rebuild indexes by default
+    assert 'Dropping index: dix_{}'.format(default_metadata_type.name) not in result.output
+
+
+def test_db_init_rebuild(global_integration_cli_args, local_config, default_metadata_type):
+    # Run on an existing database.
+    opts = list(global_integration_cli_args)
+    opts.extend(
+        [
+            '-vv', 'system', 'init', '--rebuild'
+        ]
+    )
+    result = _run_cli(
+        datacube.scripts.cli_app.cli,
+        opts
+    )
+    assert result.exit_code == 0
+    assert 'Updated.' in result.output
+    # It should have recreated views and indexes.
+    assert 'Dropping index: dix_{}'.format(default_metadata_type.name) in result.output
+    assert 'Creating index: dix_{}'.format(default_metadata_type.name) in result.output
+    assert 'Dropping view: {schema}.dv_{name}_dataset'.format(
+        schema=SCHEMA_NAME, name=default_metadata_type.name
+    ) in result.output
+    assert 'Creating view: {schema}.dv_{name}_dataset'.format(
+        schema=SCHEMA_NAME, name=default_metadata_type.name
+    ) in result.output
 
 
 def test_db_init(global_integration_cli_args, db, local_config):
@@ -173,6 +200,6 @@ def test_db_init(global_integration_cli_args, db, local_config):
     cli_method = datacube.scripts.cli_app.cli
     result = _run_cli(cli_method, opts)
     assert result.exit_code == 0
-    assert 'Done.' in result.output
+    assert 'Created.' in result.output
 
     assert has_schema(db._engine, db._connection)

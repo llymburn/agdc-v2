@@ -1,16 +1,16 @@
 from __future__ import absolute_import
 
 import logging
+
 import click
 from click import echo
+from sqlalchemy.exc import OperationalError
 
 import datacube
 from datacube.index import index_connect
+from datacube.index.postgres._api import IndexSetupError
 from datacube.ui import click as ui
 from datacube.ui.click import cli, handle_exception
-from datacube.index.postgres._api import IndexSetupError
-from sqlalchemy.exc import OperationalError
-
 
 _LOG = logging.getLogger('datacube-system')
 
@@ -29,17 +29,32 @@ def system():
     '--init-users/--no-init-users', is_flag=True, default=True,
     help="Include user roles and grants. (default: true)"
 )
+@click.option(
+    '--rebuild/--no-rebuild', is_flag=True, default=False,
+    help="Rebuild dynamic indexes & views (caution: slow)"
+)
+@click.option(
+    '--lock-table/--no-lock-table', is_flag=True, default=False,
+    help="Allow table to be locked (eg. while creating missing indexes)"
+)
 @ui.pass_index(expect_initialised=False)
-def database_init(index, default_types, init_users):
+def database_init(index, default_types, init_users, rebuild, lock_table):
     echo('Initialising database...')
 
     was_created = index.init_db(with_default_types=default_types,
                                 with_permissions=init_users)
 
     if was_created:
-        echo('Done.')
+        echo('Created.')
     else:
         echo('Updated.')
+
+    echo('Checking indexes/views.')
+    index.metadata_types.check_field_indexes(
+        allow_table_lock=lock_table,
+        rebuild_all=rebuild
+    )
+    echo('Done.')
 
 
 @system.command('check', help='Initialise the system')
@@ -66,4 +81,3 @@ def check(config_file):
         handle_exception('Error Connecting to Database: %s', e)
     except IndexSetupError as e:
         handle_exception('Database not initialised: %s', e)
-

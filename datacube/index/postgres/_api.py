@@ -11,22 +11,20 @@ Lower-level database access.
 """
 from __future__ import absolute_import
 
-import datetime
 import json
 import logging
 import re
 
-import numpy
-from pathlib import Path
-from sqlalchemy import create_engine, select, text, bindparam, exists, and_, or_, Index, func, alias
+from sqlalchemy import create_engine, select, text, bindparam, and_, or_, Index, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine.url import URL as EngineUrl
 from sqlalchemy.exc import IntegrityError
 
 import datacube
 from datacube.config import LocalConfig
-from datacube.index.fields import OrExpression
 from datacube.index.exceptions import DuplicateRecordError
+from datacube.index.fields import OrExpression
+from datacube.utils import jsonify_document
 from . import tables
 from ._fields import parse_fields, NativeField
 from .tables import DATASET, DATASET_SOURCE, METADATA_TYPE, DATASET_LOCATION, DATASET_TYPE
@@ -112,7 +110,11 @@ class PostgresDb(object):
                 ))
 
             if not tables.schema_is_latest(_engine):
-                raise IndexSetupError('\n\nDB schema is out of date.')
+                raise IndexSetupError(
+                    '\n\nDB schema is out of date. '
+                    'An administrator must run init:\n\t{init_command}'.format(
+                        init_command='datacube -v system init'
+                    ))
 
         _connection = _engine.connect()
         return PostgresDb(_engine, _connection)
@@ -164,7 +166,11 @@ class PostgresDb(object):
 
         :return: If it was newly created.
         """
-        return tables.ensure_db(self._engine, with_permissions=with_permissions)
+        is_new = tables.ensure_db(self._engine, with_permissions=with_permissions)
+        if not is_new:
+            tables.update_schema(self._engine)
+
+        return is_new
 
     def begin(self):
         """
@@ -239,13 +245,12 @@ class PostgresDb(object):
 
     def insert_dataset_source(self, classifier, dataset_id, source_dataset_id):
         try:
-            res = self._connection.execute(
+            self._connection.execute(
                 DATASET_SOURCE.insert(),
                 classifier=classifier,
                 dataset_ref=dataset_id,
                 source_dataset_ref=source_dataset_id
             )
-            return res.inserted_primary_key[0]
         except IntegrityError as e:
             if e.orig.pgcode == PGCODE_UNIQUE_CONSTRAINT:
                 raise DuplicateRecordError('Source already exists')
@@ -255,6 +260,17 @@ class PostgresDb(object):
         return self._connection.execute(
             select(_DATASET_SELECT_FIELDS).where(DATASET.c.id == dataset_id)
         ).first()
+
+    def get_derived_datasets(self, dataset_id):
+        return self._connection.execute(
+            select(
+                _DATASET_SELECT_FIELDS
+            ).select_from(
+                DATASET.join(DATASET_SOURCE, DATASET.c.id == DATASET_SOURCE.c.dataset_ref)
+            ).where(
+                DATASET_SOURCE.c.source_dataset_ref == dataset_id
+            )
+        ).fetchall()
 
     def get_dataset_sources(self, dataset_id):
         # recursively build the list of (dataset_ref, source_dataset_ref) pairs starting from dataset_id
@@ -311,6 +327,12 @@ class PostgresDb(object):
                 'Dataset type name',
                 None,
                 DATASET_TYPE.c.name
+            ),
+            'dataset_type_id': NativeField(
+                'dataset_type_id',
+                'ID of a dataset type',
+                None,
+                DATASET.c.dataset_type_ref
             ),
             'metadata_type': NativeField(
                 'metadata_type',
@@ -386,12 +408,11 @@ class PostgresDb(object):
 
         raw_expressions = [raw_expr(expression) for expression in expressions]
 
-        from_tables = DATASET.join(DATASET_TYPE).join(METADATA_TYPE)
         select_query = (
             select(
                 select_columns
             ).select_from(
-                from_tables
+                self._from_expression(DATASET, expressions)
             ).where(
                 and_(DATASET.c.archived == None, *raw_expressions)
             )
@@ -400,6 +421,39 @@ class PostgresDb(object):
         results = self._connection.execute(select_query)
         for result in results:
             yield result
+
+    def count_datasets(self, expressions):
+        """
+        :type expressions: tuple[datacube.index.postgres._fields.PgExpression]
+        :rtype: int
+        """
+
+        def raw_expr(expression):
+            if isinstance(expression, OrExpression):
+                return or_(raw_expr(expr) for expr in expression.exprs)
+            return expression.alchemy_expression
+
+        raw_expressions = [raw_expr(expression) for expression in expressions]
+
+        select_query = (
+            select(
+                [func.count('*')]
+            ).select_from(
+                self._from_expression(DATASET, expressions)
+            ).where(
+                and_(DATASET.c.archived == None, *raw_expressions)
+            )
+        )
+
+        return self._connection.scalar(select_query)
+
+    def _from_expression(self, source_table, expressions):
+        join_tables = set([expression.field.required_alchemy_table for expression in expressions])
+        from_expression = source_table
+        for table in join_tables:
+            if table != source_table:
+                from_expression = from_expression.join(table)
+        return from_expression
 
     def get_dataset_type(self, id_):
         return self._connection.execute(
@@ -425,7 +479,10 @@ class PostgresDb(object):
                          name,
                          metadata,
                          metadata_type_id,
-                         definition):
+                         definition, concurrently=False):
+
+        metadata_type_record = self.get_metadata_type(metadata_type_id)
+
         res = self._connection.execute(
             DATASET_TYPE.insert().values(
                 name=name,
@@ -434,7 +491,16 @@ class PostgresDb(object):
                 definition=definition
             )
         )
-        return res.inserted_primary_key[0]
+
+        type_id = res.inserted_primary_key[0]
+
+        # Initialise search fields.
+        _setup_collection_fields(
+            self._connection, name, self.get_dataset_fields(metadata_type_record),
+            where_expression=and_(DATASET.c.archived == None, DATASET.c.dataset_type_ref == type_id),
+            concurrently=concurrently
+        )
+        return type_id
 
     def add_metadata_type(self, name, definition, concurrently=False):
         res = self._connection.execute(
@@ -448,13 +514,35 @@ class PostgresDb(object):
 
         # Initialise search fields.
         _setup_collection_fields(
-            self._connection, name, 'dataset', self.get_dataset_fields(record),
-            metadata_type_id=type_id,
+            self._connection, name, self.get_dataset_fields(record),
+            where_expression=and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == type_id),
             concurrently=concurrently
         )
 
+    def check_dynamic_fields(self, concurrently=False, rebuild_all=False):
+        _LOG.info('Checking dynamic views/indexes. (rebuild all = %s)', rebuild_all)
+        for metadata_type in self.get_all_metadata_types():
+            _setup_collection_fields(
+                self._connection, metadata_type['name'], self.get_dataset_fields(metadata_type),
+                where_expression=and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == metadata_type['id']),
+                concurrently=concurrently,
+                replace_existing=rebuild_all
+            )
+
+        for dataset_type in self.get_all_dataset_types():
+            _setup_collection_fields(
+                self._connection, dataset_type['name'],
+                self.get_dataset_fields(self.get_metadata_type(dataset_type['metadata_type_ref'])),
+                where_expression=and_(DATASET.c.archived == None, DATASET.c.dataset_type_ref == dataset_type['id']),
+                concurrently=concurrently,
+                replace_existing=rebuild_all
+            )
+
     def get_all_dataset_types(self):
-        return self._connection.execute(DATASET_TYPE.select()).fetchall()
+        return self._connection.execute(DATASET_TYPE.select().order_by(DATASET_TYPE.c.name.asc())).fetchall()
+
+    def get_all_metadata_types(self):
+        return self._connection.execute(METADATA_TYPE.select().order_by(METADATA_TYPE.c.name.asc())).fetchall()
 
     def get_locations(self, dataset_id):
         return [
@@ -546,80 +634,90 @@ def _pg_exists(conn, name):
     return conn.execute("SELECT to_regclass(%s)", name).scalar() is not None
 
 
-def _setup_collection_fields(conn, collection_prefix, doc_prefix, fields, metadata_type_id, concurrently=False):
+def _setup_collection_fields(conn, collection_prefix, fields, where_expression,
+                             concurrently=False, replace_existing=False):
     """
     Create indexes and views for a collection's search fields.
     """
-    name = '{}_{}'.format(collection_prefix.lower(), doc_prefix.lower())
-
-    where_expression = and_(DATASET.c.archived == None, DATASET.c.metadata_type_ref == metadata_type_id)
+    name = collection_prefix.lower()
 
     # Create indexes for the search fields.
     for field in fields.values():
         index_type = field.postgres_index_type
         if index_type:
             # Our normal indexes start with "ix_", dynamic indexes with "dix_"
-            index_name = 'dix_field_{prefix}_{field_name}'.format(
+            index_name = 'dix_{prefix}_{field_name}'.format(
                 prefix=name.lower(),
                 field_name=field.name.lower()
             )
+            # Previous naming scheme
+            legacy_name = 'dix_field_{prefix}_dataset_{field_name}'.format(
+                prefix=name.lower(),
+                field_name=field.name.lower()
+            )
+            index = Index(
+                index_name,
+                field.alchemy_expression,
+                postgresql_where=where_expression,
+                postgresql_using=index_type,
+                # Don't lock the table (in the future we'll allow indexing new fields...)
+                postgresql_concurrently=concurrently
+            )
+            exists = _pg_exists(conn, tables.schema_qualified(index_name))
+            legacy_exists = _pg_exists(conn, tables.schema_qualified(legacy_name))
 
-            if not _pg_exists(conn, tables.schema_qualified(index_name)):
+            # This currently leaves a window of time without indexes: it's primarily intended for development.
+            if replace_existing:
+                if exists:
+                    _LOG.debug('Dropping index: %s (replace=%r)', index_name, replace_existing)
+                    index.drop(conn)
+                    exists = False
+                if legacy_exists:
+                    _LOG.debug('Dropping legacy index: %s (replace=%r)', legacy_name, replace_existing)
+                    Index(legacy_name, field.alchemy_expression).drop(conn)
+                    legacy_exists = False
+
+            if not (exists or legacy_exists):
                 _LOG.debug('Creating index: %s', index_name)
-                Index(
-                    index_name,
-                    field.alchemy_expression,
-                    postgresql_where=where_expression,
-                    postgresql_using=index_type,
-                    # Don't lock the table (in the future we'll allow indexing new fields...)
-                    postgresql_concurrently=concurrently
-                ).create(conn)
+                index.create(conn)
             else:
-                _LOG.debug('Index exists: %s', index_name)
+                _LOG.debug('Index exists: %s  (replace=%r)', index_name, replace_existing)
 
     # Create a view of search fields (for debugging convenience).
-    view_name = tables.schema_qualified(name)
-    if not _pg_exists(conn, view_name):
+    # 'dv_' prefix: dynamic view. To distinguish from views that are created as part of the schema itself.
+    view_name = tables.schema_qualified('dv_{}_dataset'.format(name))
+    exists = _pg_exists(conn, view_name)
+
+    # This currently leaves a window of time without the views: it's primarily intended for development.
+    if exists and replace_existing:
+        _LOG.debug('Dropping view: %s (replace=%r)', view_name, replace_existing)
+        conn.execute('drop view %s' % view_name)
+        exists = False
+
+    if not exists:
+        _LOG.debug('Creating view: %s', view_name)
         conn.execute(
-            tables.View(
+            tables.CreateView(
                 view_name,
                 select(
                     [field.alchemy_expression.label(field.name) for field in fields.values()]
                 ).select_from(
-                    DATASET.join(DATASET_TYPE).join(METADATA_TYPE)
+                    DATASET
                 ).where(where_expression)
             )
         )
+    else:
+        _LOG.debug('View exists: %s (replace=%r)', view_name, replace_existing)
 
-
-def _transform_object_tree(o, f):
-    if isinstance(o, dict):
-        return {k: _transform_object_tree(v, f) for k, v in o.items()}
-    if isinstance(o, list):
-        return [_transform_object_tree(v, f) for v in o]
-    if isinstance(o, tuple):
-        return tuple(_transform_object_tree(v, f) for v in o)
-    return f(o)
+    legacy_name = tables.schema_qualified('{}_dataset'.format(name))
+    if _pg_exists(conn, legacy_name):
+        _LOG.debug('Dropping legacy view: %s', legacy_name)
+        conn.execute('drop view %s' % legacy_name)
 
 
 def _to_json(o):
     # Postgres <=9.5 doesn't support NaN and Infinity
-    def fixup_value(v):
-        if isinstance(v, float):
-            if v != v:
-                return "NaN"
-            if v == float("inf"):
-                return "Infinity"
-            if v == float("-inf"):
-                return "-Infinity"
-        if isinstance(v, (datetime.datetime, datetime.date)):
-            return v.isoformat()
-        if isinstance(v, numpy.dtype):
-            return v.name
-        return v
-
-    fixedup = _transform_object_tree(o, fixup_value)
-
+    fixedup = jsonify_document(o)
     return json.dumps(fixedup, default=_json_fallback)
 
 

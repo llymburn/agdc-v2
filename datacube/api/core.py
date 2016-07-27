@@ -207,7 +207,7 @@ class Datacube(object):
         :param like: Uses the output of a previous ``load()`` to form the basis of a request for another product.
             E.g.::
 
-                pq = dc.load(product='ls5_pq_albers`, like='ls5_nbar_albers')
+                pq = dc.load(product='ls5_pq_albers', like=nbar_dataset)
 
         :type like: xarray.Dataset
 
@@ -308,7 +308,7 @@ class Datacube(object):
         """
         Creates an empty :class:`xarray.Dataset` to hold data from :meth:`product_sources`.
 
-        :param xarray.DataArray sources: DataArray holding a list of :py:class:`datacube.model.Dataset` objects
+        :param dict coords: OrderedDict-like holding `DataArray` objects of the dimensions not specified by `geobox`
         :param GeoBox geobox: A GeoBox defining the output spatial projection and resolution
         :param measurements: list of measurement dicts with keys: {'name', 'dtype', 'nodata', 'units'}
         :param fill_func: function to fill the data
@@ -325,7 +325,7 @@ class Datacube(object):
         for name, coord in coords.items():
             result[name] = coord
         for name, coord in geobox.coordinates.items():
-            result[name] = (name, coord.labels, {'units': coord.units})
+            result[name] = (name, coord.values, {'units': coord.units})
 
         for measurement in measurements:
             data = data_func(measurement)
@@ -340,7 +340,8 @@ class Datacube(object):
             if 'spectral_definition' in measurement:
                 attrs['spectral_definition'] = measurement['spectral_definition']
 
-            result[measurement['name']] = (coords.dims + geobox.dimensions, data, attrs)
+            dims = tuple(coords.keys()) + tuple(geobox.dimensions)
+            result[measurement['name']] = (dims, data, attrs)
 
         return result
 

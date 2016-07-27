@@ -200,16 +200,9 @@ class DatasetSource(object):
         return idx
 
 
-def _write_variable_to_netcdf(nco, name, variable, **var_params):
-    data_var = netcdf_writer.create_variable(nco, name, variable, **var_params)
-    data_var[:] = netcdf_writer.netcdfy_data(variable.values)
-
-    # TODO: 'flags_definition', 'spectral_definition'?
-    for key, value in var_params.get('attrs', {}).items():
-        setattr(data_var, key, value)
-
-
-def write_dataset_to_netcdf(access_unit, global_attributes, variable_params, filename):
+def create_netcdf_storage_unit(filename,
+                               crs, coordinates, variables, variable_params, global_attributes=None,
+                               netcdfparams=None):
     if filename.exists():
         raise RuntimeError('Storage Unit already exists: %s' % filename)
 
@@ -218,25 +211,37 @@ def write_dataset_to_netcdf(access_unit, global_attributes, variable_params, fil
     except OSError:
         pass
 
-    nco = netcdf_writer.create_netcdf(str(filename))
+    nco = netcdf_writer.create_netcdf(str(filename), **(netcdfparams or {}))
 
-    for name, coord in access_unit.coords.items():
+    for name, coord in coordinates.items():
         netcdf_writer.create_coordinate(nco, name, coord.values, coord.units)
 
-    netcdf_writer.create_grid_mapping_variable(nco, access_unit.crs)
+    netcdf_writer.create_grid_mapping_variable(nco, crs)
 
-    for name, variable in access_unit.data_vars.items():
-        assert all(dim in variable.dims for dim in access_unit.crs.dimensions) == ('crs' in variable.attrs), 'crs err'
-        _write_variable_to_netcdf(nco, name, variable, **variable_params.get(name, {}))
+    for name, variable in variables.items():
+        set_crs = all(dim in variable.dims for dim in crs.dimensions)
+        var_params = variable_params.get(name, {})
+        data_var = netcdf_writer.create_variable(nco, name, variable, set_crs=set_crs, **var_params)
 
-    # write global atrributes
-    for key, value in global_attributes.items():
+        for key, value in var_params.get('attrs', {}).items():
+            setattr(data_var, key, value)
+
+    for key, value in (global_attributes or {}).items():
         setattr(nco, key, value)
 
-    nco.close()
+    return nco
 
 
-def append_variable_to_netcdf(filename, name, variable, **var_params):
-    nco = netcdf_writer.append_netcdf(str(filename))
-    _write_variable_to_netcdf(nco, name, variable, **var_params)
+def write_dataset_to_netcdf(access_unit, global_attributes, variable_params, filename, netcdfparams=None):
+    nco = create_netcdf_storage_unit(filename,
+                                     access_unit.crs,
+                                     access_unit.coords,
+                                     access_unit.data_vars,
+                                     variable_params,
+                                     global_attributes,
+                                     netcdfparams)
+
+    for name, variable in access_unit.data_vars.items():
+        nco[name][:] = netcdf_writer.netcdfy_data(variable.values)
+
     nco.close()

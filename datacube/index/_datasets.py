@@ -9,7 +9,7 @@ import logging
 import cachetools
 
 from datacube import compat
-from datacube.utils import InvalidDocException
+from datacube.utils import InvalidDocException, check_doc_unchanged, jsonify_document
 from datacube.model import Dataset, DatasetType, MetadataType
 from .exceptions import DuplicateRecordError
 from . import fields
@@ -43,7 +43,7 @@ class MetadataTypeResource(object):
         if existing:
             # They've passed us the same one again. Make sure it matches what is stored.
             # TODO: Support for adding/updating search fields?
-            fields.check_doc_unchanged(
+            check_doc_unchanged(
                 existing.definition,
                 definition,
                 'Metadata Type {}'.format(name)
@@ -72,6 +72,17 @@ class MetadataTypeResource(object):
         if not record:
             return None
         return self._make(record)
+
+    def check_field_indexes(self, allow_table_lock=False, rebuild_all=False):
+        """
+        Create or replace per-field indexes and views.
+        :param allow_table_lock:
+            Allow an exclusive lock to be taken on the table while creating the indexes.
+            This will halt other user's requests until completed.
+
+            If false, creation will be slightly slower and cannot be done in a transaction.
+        """
+        self._db.check_dynamic_fields(concurrently=not allow_table_lock, rebuild_all=rebuild_all)
 
     def _make_many(self, query_rows):
         return (self._make(c) for c in query_rows)
@@ -137,7 +148,7 @@ class DatasetTypeResource(object):
         if existing:
             # TODO: Support for adding/updating match rules?
             # They've passed us the same collection again. Make sure it matches what is stored.
-            fields.check_doc_unchanged(
+            check_doc_unchanged(
                 existing.definition,
                 type_.definition,
                 'Dataset type {}'.format(type_.name)
@@ -229,7 +240,6 @@ class DatasetResource(object):
         self._db = db
         self.types = dataset_type_resource
 
-    @cachetools.cached(cachetools.TTLCache(100, 60))
     def get(self, id_, include_sources=False):
         """
         Get dataset by id
@@ -251,6 +261,9 @@ class DatasetResource(object):
                 for source, classifier in zip(result['sources'], result['classes']) if source
             }
         return datasets[id_][0]
+
+    def get_derived(self, id_):
+        return [self._make(result) for result in self._db.get_derived_datasets(id_)]
 
     def has(self, dataset):
         """
@@ -289,9 +302,9 @@ class DatasetResource(object):
             if not was_inserted:
                 existing = self.get(dataset.id)
                 if existing:
-                    fields.check_doc_unchanged(
+                    check_doc_unchanged(
                         existing.metadata_doc,
-                        dataset.metadata_doc,
+                        jsonify_document(dataset.metadata_doc),
                         'Dataset {}'.format(dataset.id)
                     )
         finally:
@@ -374,46 +387,62 @@ class DatasetResource(object):
         """
         return self._make_many(self._do_search(query))
 
+    def count(self, **query):
+        """
+        Perform a search, returning count of results.
+        :type query: dict[str,str|float|datacube.model.Range]
+        :rtype: int
+        """
+        return self._do_count(query)
+
+    def _get_dataset_types(self, q):
+        types = set()
+        if 'product' in q.keys():
+            types.add(self.types.get_by_name(q['product']))
+        else:
+            # Otherwise search any metadata type that has all the given search fields.
+            types = self.types.get_with_fields(tuple(q.keys()))
+            if not types:
+                raise ValueError('No type of dataset has fields: %r', tuple(q.keys()))
+
+        return types
+
     def _do_search(self, query, return_fields=False, with_source_ids=False):
         q = dict(query)
-        metadata_types = set()
-        if 'product' in q.keys():
-            metadata_types.add(self.types.get_by_name(q['product']).metadata_type)
+        dataset_types = self._get_dataset_types(q)
 
-        # If they specified a metadata type, search using it.
-        if 'metadata_type' in q.keys():
-            metadata_types.add(self.types.metadata_type_resource.get_by_name(q['metadata_type']))
-            # Don't need to duplicate the param.
-            del q['metadata_type']
+        # We don't need to match product name as we're searching via product (ie 'dataset_type')
+        if 'product' in q:
+            del q['product']
 
-        if len(metadata_types) > 1:
-            _LOG.warning(
-                "Both a dataset type and metadata type were specified, but they're not compatible: %r, %r.",
-                query['product'], query['metadata_type']
-            )
-            # No datasets of this type can have the given metadata type.
-            # No results.
-            return
-
-        if not metadata_types:
-            # Otherwise search any metadata type that has all the given search fields.
-            applicable_dataset_types = self.types.get_with_fields(tuple(q.keys()))
-            if not applicable_dataset_types:
-                raise ValueError('No type of dataset has fields: %r', tuple(q.keys()))
-            # Unique metadata types we're searching.
-            metadata_types = set(d.metadata_type for d in applicable_dataset_types)
-
-        # Perform one search per metadata type.
-        for metadata_type in metadata_types:
-            q['metadata_type_id'] = metadata_type.id
-            query_exprs = tuple(fields.to_expressions(metadata_type.dataset_fields.get, **q))
+        # Perform one search per type.
+        for dataset_type in dataset_types:
+            q['dataset_type_id'] = dataset_type.id
+            dataset_fields = dataset_type.metadata_type.dataset_fields
+            query_exprs = tuple(fields.to_expressions(dataset_fields.get, **q))
             select_fields = None
             if return_fields:
-                select_fields = tuple(metadata_type.dataset_fields.values())
+                select_fields = tuple(dataset_fields.values())
             for dataset in self._db.search_datasets(query_exprs,
                                                     select_fields=select_fields,
                                                     with_source_ids=with_source_ids):
                 yield dataset
+
+    def _do_count(self, query):
+        q = dict(query)
+        dataset_types = self._get_dataset_types(q)
+        result = 0
+
+        # We don't need to match product name as we're searching via product (ie 'dataset_type')
+        if 'product' in q:
+            del q['product']
+
+        for dataset_type in dataset_types:
+            q['dataset_type_id'] = dataset_type.id
+            dataset_fields = dataset_type.metadata_type.dataset_fields
+            query_exprs = tuple(fields.to_expressions(dataset_fields.get, **q))
+            result += self._db.count_datasets(query_exprs)
+        return result
 
     def search_summaries(self, **query):
         """
