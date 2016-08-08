@@ -41,6 +41,7 @@ Low-Level Internal Functions
 
    Datacube.measurement_data
 
+.. _grid-workflow-class:
 
 GridWorkflow Class
 ------------------
@@ -89,6 +90,20 @@ API for Analytics and Execution Engine
     API.list_variables
     API.get_descriptor
     API.get_data
+
+
+
+.. _query-class:
+
+Query Class
+-----------
+
+.. currentmodule:: datacube.api.query
+
+.. autosummary::
+   :toctree: generate/
+
+   Query
 
 
 User Configuration

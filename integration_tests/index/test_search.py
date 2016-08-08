@@ -11,6 +11,7 @@ import uuid
 
 import pytest
 from click.testing import CliRunner
+from dateutil import tz
 from pathlib import Path
 
 import datacube.scripts.search_tool
@@ -192,6 +193,21 @@ def test_search_globally(index, pseudo_telemetry_dataset):
     assert len(results) == 1
 
 
+def test_search_by_product(index, pseudo_telemetry_type, pseudo_telemetry_dataset, ls5_nbar_gtiff_type):
+    """
+    :type index: datacube.index._api.Index
+    """
+    # Expect one product with our one dataset.
+    products = list(index.datasets.search_by_product(
+        platform='LANDSAT_8',
+        instrument='OLI_TIRS',
+    ))
+    assert len(products) == 1
+    product, datasets = products[0]
+    assert product.id == pseudo_telemetry_type.id
+    assert next(datasets).id == pseudo_telemetry_dataset.id
+
+
 def test_searches_only_type(index, pseudo_telemetry_type, pseudo_telemetry_dataset, ls5_nbar_gtiff_type):
     """
     :type index: datacube.index._api.Index
@@ -231,7 +247,7 @@ def test_searches_only_type(index, pseudo_telemetry_type, pseudo_telemetry_datas
     # One result when no types specified.
     datasets = index.datasets.search_eager(
         platform='LANDSAT_8',
-        instrument='OLI_TIRS',
+        instrument='OLI_TIRS'
     )
     assert len(datasets) == 1
     assert datasets[0].id == pseudo_telemetry_dataset.id
@@ -241,6 +257,28 @@ def test_searches_only_type(index, pseudo_telemetry_type, pseudo_telemetry_datas
         metadata_type='telemetry',
         platform='LANDSAT_8',
         instrument='OLI_TIRS'
+    )
+    assert len(datasets) == 0
+
+
+def test_search_special_fields(index, pseudo_telemetry_type, pseudo_telemetry_dataset, ls5_nbar_gtiff_type):
+    """
+    :type index: datacube.index._api.Index
+    :type pseudo_telemetry_type: datacube.model.DatasetType
+    :type pseudo_telemetry_dataset: datacube.model.Dataset
+    """
+
+    # 'product' is a special case
+    datasets = index.datasets.search_eager(
+        product=pseudo_telemetry_type.name
+    )
+    assert len(datasets) == 1
+    assert datasets[0].id == pseudo_telemetry_dataset.id
+
+    # Unknown field: no results
+    datasets = index.datasets.search_eager(
+        platform='LANDSAT_8',
+        flavour='chocolate',
     )
     assert len(datasets) == 0
 
@@ -328,6 +366,70 @@ def test_count_searches(index, pseudo_telemetry_type, pseudo_telemetry_dataset, 
         instrument='OLI_TIRS'
     )
     assert datasets == 0
+
+
+def test_count_time_groups(index, pseudo_telemetry_type, pseudo_telemetry_dataset):
+    """
+    :type index: datacube.index._api.Index
+    """
+
+    # 'from_dt': datetime.datetime(2014, 7, 26, 23, 48, 0, 343853),
+    # 'to_dt': datetime.datetime(2014, 7, 26, 23, 52, 0, 343853),
+    timeline = list(index.datasets.count_product_through_time(
+        '1 day',
+        product=pseudo_telemetry_type.name,
+        time=Range(
+            datetime.datetime(2014, 7, 25, tzinfo=tz.tzutc()),
+            datetime.datetime(2014, 7, 27, tzinfo=tz.tzutc())
+        )
+    ))
+
+    assert len(timeline) == 2
+    assert timeline == [
+        (
+            Range(datetime.datetime(2014, 7, 25, tzinfo=tz.tzutc()),
+                  datetime.datetime(2014, 7, 26, tzinfo=tz.tzutc())),
+            0
+        ),
+        (
+            Range(datetime.datetime(2014, 7, 26, tzinfo=tz.tzutc()),
+                  datetime.datetime(2014, 7, 27, tzinfo=tz.tzutc())),
+            1
+        )
+    ]
+
+
+def test_count_time_groups_cli(global_integration_cli_args, pseudo_telemetry_type, pseudo_telemetry_dataset):
+    """
+    Search datasets using the cli.
+    :type global_integration_cli_args: tuple[str]
+    :type default_metadata_type: datacube.model.Collection
+    :type pseudo_telemetry_dataset: datacube.model.Dataset
+    """
+    opts = list(global_integration_cli_args)
+    opts.extend(
+        [
+            'product-counts',
+            '1 day',
+            '2014-07-25 < time < 2014-07-27'
+        ]
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        datacube.scripts.search_tool.cli,
+        opts,
+        catch_exceptions=False
+    )
+    assert result.exit_code == 0
+
+    expected_out = (
+        '{}\n'
+        '    2014-07-25: 0\n'
+        '    2014-07-26: 1\n'
+    ).format(pseudo_telemetry_type.name)
+
+    assert result.output == expected_out
 
 
 def test_search_cli_basic(global_integration_cli_args, default_metadata_type, pseudo_telemetry_dataset):

@@ -1,7 +1,9 @@
 from __future__ import absolute_import
 
+import sys
 import logging
 import click
+import yaml
 
 from pathlib import Path
 
@@ -88,7 +90,7 @@ def load_rules_from_file(filename, index):
         if not type_:
             _LOG.error('DatasetType %s does not exists', rule['type'])
             return
-        if not contains(type_.metadata, rule['metadata']):
+        if not contains(type_.metadata_doc, rule['metadata']):
             _LOG.error('DatasetType %s can\'t be matched by its own rule', rule['type'])
             return
         rule['type'] = type_
@@ -108,7 +110,7 @@ def load_rules_from_types(index, type_names=None):
     else:
         types += index.products.get_all()
 
-    rules = [{'type': type_, 'metadata': type_.metadata} for type_ in types]
+    rules = [{'type': type_, 'metadata': type_.metadata_doc} for type_ in types]
     return rules
 
 
@@ -148,6 +150,7 @@ def index_cmd(index, match_rules, dtype, auto_match, dry_run, datasets):
             try:
                 dataset = match_dataset(metadata_doc, uri, rules)
             except RuntimeError as e:
+                _LOG.exception("Error creating dataset")
                 _LOG.error('Unable to create Dataset for %s: %s', uri, e)
                 continue
 
@@ -159,3 +162,76 @@ def index_cmd(index, match_rules, dtype, auto_match, dry_run, datasets):
             _LOG.info('Matched %s', dataset)
             if not dry_run:
                 index.datasets.add(dataset)
+
+
+def build_dataset_info(index, dataset, show_derived=False):
+    deriveds = []
+    if show_derived:
+        deriveds = index.datasets.get_derived(dataset.id)
+
+    # def find_me(derived):
+    #     for key, source in derived.sources.items():
+    #         print(dataset.id, source.id)
+    #         if dataset.id == source.id:
+    #             return key
+
+    return {
+        'id': dataset.id,
+        'product': dataset.type.name,
+        'location': dataset.local_uri,
+        'sources': {key: build_dataset_info(index, source) for key, source in dataset.sources.items()},
+        'derived': [build_dataset_info(index, derived) for derived in deriveds]
+    }
+
+
+@dataset_cmd.command('info', help="Archive datasets")
+@click.option('--show-sources', help='Also show sources', is_flag=True, default=False)
+@click.option('--show-derived', help='Also show sources', is_flag=True, default=False)
+@click.argument('ids', nargs=-1)
+@ui.pass_index()
+def info_cmd(index, show_sources, show_derived, ids):
+    for id_ in ids:
+        dataset = index.datasets.get(id_, include_sources=show_sources)
+        if not dataset:
+            click.echo('%s missing' % id_)
+            continue
+
+        yaml.safe_dump(build_dataset_info(index, dataset, show_derived), stream=sys.stdout)
+
+
+def get_derived_set(index, id_):
+    derived_set = {id_}
+    to_process = {id_}
+    while to_process:
+        derived = index.datasets.get_derived(to_process.pop())
+        to_process.update(d.id for d in derived)
+        derived_set.update(d.id for d in derived)
+    return derived_set
+
+
+@dataset_cmd.command('archive', help="Archive datasets")
+@click.option('--archive-derived', '-d', help='Also recursively archive derived datasets', is_flag=True, default=False)
+@click.option('--dry-run', help="Don't archive. Display datasets that would get archived",
+              is_flag=True, default=False)
+@click.argument('ids', nargs=-1)
+@ui.pass_index()
+def archive_cmd(index, archive_derived, dry_run, ids):
+    for id_ in ids:
+        to_process = get_derived_set(index, id_) if archive_derived else [id_]
+        click.echo('Archiving %s' % ', '.join(to_process))
+        if not dry_run:
+            index.datasets.archive(to_process)
+
+
+@dataset_cmd.command('restore', help="Restore datasets")
+@click.option('--restore-derived', '-d', help='Also recursively restore derived datasets', is_flag=True, default=False)
+@click.option('--dry-run', help="Don't restore. Display datasets that would get restored",
+              is_flag=True, default=False)
+@click.argument('ids', nargs=-1)
+@ui.pass_index()
+def restore_cmd(index, restore_derived, dry_run, ids):
+    for id_ in ids:
+        to_process = get_derived_set(index, id_) if restore_derived else [id_]
+        click.echo('Restoring %s' % ', '.join(to_process))
+        if not dry_run:
+            index.datasets.restore(to_process)

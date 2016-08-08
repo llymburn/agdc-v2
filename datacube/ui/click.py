@@ -15,6 +15,7 @@ import click
 from datacube import config, __version__
 from datacube.executor import get_executor
 from datacube.index import index_connect
+from pathlib import Path
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 _LOG_FORMAT_STRING = '%(asctime)s %(levelname)s %(message)s'
@@ -174,10 +175,9 @@ def pass_index(app_name=None, expect_initialised=True):
     def decorate(f):
         def with_index(*args, **kwargs):
             ctx = click.get_current_context()
-            application_name = app_name or re.sub('[^0-9a-zA-Z]+', '-', ctx.command_path)
             try:
                 index = index_connect(ctx.obj['config_file'],
-                                      application_name=application_name,
+                                      application_name=app_name or ctx.command_path,
                                       validate_connection=expect_initialised)
                 return f(index, *args, **kwargs)
             except (OperationalError, ProgrammingError) as e:
@@ -238,3 +238,10 @@ def handle_exception(msg, e):
         else:
             click.echo(msg)
         ctx.exit(1)
+
+
+def to_pathlib(ctx, param, value):
+    if value:
+        return Path(value)
+    else:
+        return None

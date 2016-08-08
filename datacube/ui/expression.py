@@ -18,7 +18,9 @@ Data Access Module
 from __future__ import absolute_import, print_function, division
 
 import re
+from datetime import datetime
 
+from dateutil import tz
 from pypeg2 import word, attr, List, maybe_some, parse as peg_parse
 
 from datacube.model import Range
@@ -30,6 +32,9 @@ NUMBER = re.compile(r"[-+]?(\d*\.\d+|\d+\.\d*|\d+)")
 LIMITED_STRING = re.compile(r"[a-zA-Z][\w\._-]*")
 # Inside string quotation marks. Kept simple. We're not supporting escapes or much else yet...
 STRING_CONTENTS = re.compile(r"[\w\s\._-]*")
+
+# Either a day '2016-02-20' or a month '2016-02'
+DATE = re.compile(r"\d{4}-\d{2}(-\d{2})?")
 
 
 class Expr(object):
@@ -84,6 +89,30 @@ class NumericValue(Expr):
         return float(self.value)
 
 
+class DateValue(Expr):
+    def __init__(self, value=None):
+        self.value = value
+
+    grammar = attr(u'value', DATE)
+
+    def __str__(self):
+        return self.value
+
+    def __repr__(self):
+        return self.value
+
+    def query_repr(self, get_field):
+        return self.as_value()
+
+    def as_value(self):
+        parts = self.value.split('-')
+        parts.reverse()
+        year = parts.pop()
+        month = parts.pop()
+        day = parts[0] if parts else '1'
+        return datetime(int(year), int(month), int(day), tzinfo=tz.tzutc())
+
+
 class EqualsExpression(Expr):
     def __init__(self, field_name=None, value=None):
         self.field_name = field_name
@@ -109,7 +138,9 @@ class BetweenExpression(Expr):
 
     grammar = [
         (attr(u'low_value', NumericValue), u'<', FIELD_NAME, u'<', attr(u'high_value', NumericValue)),
-        (attr(u'high_value', NumericValue), u'>', FIELD_NAME, u'>', attr(u'low_value', NumericValue))
+        (attr(u'high_value', NumericValue), u'>', FIELD_NAME, u'>', attr(u'low_value', NumericValue)),
+        (attr(u'low_value', DateValue), u'<', FIELD_NAME, u'<', attr(u'high_value', DateValue)),
+        (attr(u'high_value', DateValue), u'>', FIELD_NAME, u'>', attr(u'low_value', DateValue))
     ]
 
     def __str__(self):

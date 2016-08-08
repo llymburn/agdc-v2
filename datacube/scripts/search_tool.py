@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-Query datasets and storage units.
+Query datasets.
 """
 from __future__ import absolute_import
 from __future__ import print_function
@@ -93,15 +93,15 @@ def datasets(ctx, index, expression):
     )
 
 
-@cli.command(help='Storage units')
+@cli.command('product-counts', help='Counts')
+@click.argument('period', nargs=1)
 @click.argument('expression', nargs=-1)
 @PASS_INDEX
-@click.pass_context
-def units(ctx, index, expression):
-    ctx.obj['write_results'](
-        index.storage.get_fields().keys(),
-        index.storage.search_summaries(**parse_expressions(*expression))
-    )
+def product_counts(index, period, expression):
+    for product, series in index.datasets.count_by_product_through_time(period, **parse_expressions(*expression)):
+        click.echo(product.name)
+        for timerange, count in series:
+            click.echo('    {}: {}'.format(timerange[0].strftime("%Y-%m-%d"), count))
 
 
 @singledispatch

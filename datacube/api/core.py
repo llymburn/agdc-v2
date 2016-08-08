@@ -137,7 +137,7 @@ class Datacube(object):
         return measurements
 
     def load(self, product=None, measurements=None, output_crs=None, resolution=None, stack=False, dask_chunks=None,
-             like=None, **query):
+             like=None, fuse_func=None, align=None, **query):
         """
         Loads data as an ``xarray`` object.
 
@@ -193,6 +193,8 @@ class Datacube(object):
             This includes the direction (as indicated by a positive or negative number).
             Typically when using most CRSs, the first number would be negative.
 
+        :param (float,float) align: Load data such that point 'align' lies on the pixel boundary. Default is (0,0)
+
         :param stack: The name of the new dimension used to stack the measurements.
             If provided, the data is returned as a ``DataArray`` rather than a ``Dataset``.
             If only one measurement is returned, the dimension name is not used and the dimension is dropped.
@@ -214,20 +216,11 @@ class Datacube(object):
         :return: Requested data.  As a ``DataArray`` if the ``stack`` variable is supplied.
         :rtype: :class:`xarray.Dataset` or :class:`xarray.DataArray`
         """
-        if product is not None:
-            query['product'] = product
-
-        if like is not None:
-            query['like'] = like
-
-        observations = self.product_observations(**query)
+        observations = self.product_observations(product=product, like=like, **query)
         if not observations:
             return None if stack else xarray.Dataset()
 
-        crs = CRS(output_crs) if output_crs else query_crs_like(like) or get_crs(observations)
-        geopolygon = query_geopolygon(**query) or query_geopolygon_like(like) or get_bounds(observations, crs)
-        resolution = resolution or query_resolution_like(like) or get_resolution(observations)
-        geobox = GeoBox.from_geopolygon(geopolygon, resolution, crs)
+        geobox = self._get_geobox(observations, output_crs, resolution, like=like, align=align, **query)
 
         group_by = query_group_by(**query)
         sources = self.product_sources(observations, group_by.group_by_func, group_by.dimension, group_by.units)
@@ -240,18 +233,29 @@ class Datacube(object):
             measurements = all_measurements
 
         if not stack:
-            return self.product_data(sources, geobox, measurements.values(), dask_chunks=dask_chunks)
+            return self.product_data(sources, geobox, measurements.values(),
+                                     fuse_func=fuse_func, dask_chunks=dask_chunks)
         else:
             if not isinstance(stack, string_types):
                 stack = 'measurement'
             return self._get_data_array(sources, geobox, measurements.values(),
-                                        var_dim_name=stack, dask_chunks=dask_chunks)
+                                        var_dim_name=stack, fuse_func=fuse_func, dask_chunks=dask_chunks)
 
-    def _get_data_array(self, sources, geobox, measurements, var_dim_name='measurement', dask_chunks=None):
+    @staticmethod
+    def _get_geobox(observations, output_crs=None, resolution=None, like=None, align=None, **query):
+        crs = CRS(output_crs) if output_crs else query_crs_like(like) or get_crs(observations)
+        geopolygon = query_geopolygon(**query) or query_geopolygon_like(like) or get_bounds(observations, crs)
+        resolution = resolution or query_resolution_like(like) or get_resolution(observations)
+        geobox = GeoBox.from_geopolygon(geopolygon, resolution, crs, align)
+        return geobox
+
+    def _get_data_array(self, sources, geobox, measurements, var_dim_name='measurement',
+                        fuse_func=None, dask_chunks=None):
         data_dict = OrderedDict()
         for measurement in measurements:
             name = measurement['name']
-            data_dict[name] = self.measurement_data(sources, geobox, measurement, dask_chunks=dask_chunks)
+            data_dict[name] = self.measurement_data(sources, geobox, measurement,
+                                                    fuse_func=fuse_func, dask_chunks=dask_chunks)
 
         return _stack_vars(data_dict, var_dim_name)
 
@@ -404,6 +408,18 @@ class Datacube(object):
     def __repr__(self):
         return self.__str__()
 
+    def close(self):
+        """
+        Close any open connections
+        """
+        self.index.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type_, value, traceback):
+        self.close()
+
 
 def fuse_lazy(datasets, geobox, measurement, fuse_func=None, prepend_dims=0):
     prepend_shape = (1,) * prepend_dims
@@ -536,10 +552,16 @@ def _make_dask_array(sources, geobox, measurement, fuse_func=None, dask_chunks=N
 
 
 def _stack_vars(data_dict, var_dim_name, stack_name=None):
+    if not data_dict:
+        return xarray.DataArray(None)
     if len(data_dict) == 1:
         key, value = data_dict.popitem()
+        value.coords[var_dim_name] = key
+        if stack_name:
+            value.name = stack_name
         return value
     labels = list(data_dict.keys())
+
     stack = xarray.concat(
         [data_dict[var_name] for var_name in labels],
         dim=xarray.DataArray(labels, name=var_dim_name, dims=var_dim_name),
